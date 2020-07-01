@@ -36,7 +36,6 @@ async fn main() {
             let subscribed = pubsub.subscribe("Chat 1").await;
             println!("subbed: {:?}", subscribed);
             while let Some(result) = pubsub.on_message().next().await {
-                println!("nothin");
                 println!("{:?}", result);
             };
 
@@ -121,13 +120,13 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, pool: &bb8::Poo
 
     // Send off to Redis
     let mut conn = pool.get().await.unwrap();
-    let reply: String = redis::cmd("SET")
+    let reply: String = redis::cmd("PUBLISH")
         .arg("Chat 1")
         .arg("Hi")
         .query_async(&mut *conn)
         .await
         .unwrap();
-    println!("pub: {}", reply);
+    println!("pub: {:?}", reply);
 
     // New message from this user, send it to everyone else (except same uid)...
     for (&uid, tx) in users.read().await.iter() {
