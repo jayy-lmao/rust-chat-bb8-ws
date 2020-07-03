@@ -1,5 +1,6 @@
 use bb8_redis::{bb8, redis, RedisConnectionManager};
 use futures::{FutureExt, StreamExt};
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::env;
 use std::sync::{
@@ -10,6 +11,13 @@ use tokio::prelude::*;
 use tokio::sync::{mpsc, RwLock};
 use warp::ws::{Message, WebSocket};
 use warp::Filter;
+
+#[derive(Serialize, Deserialize)]
+pub struct ChatMessage {
+    userId: usize,
+    channel: String,
+    content: String,
+}
 
 static NEXT_USER_ID: AtomicUsize = AtomicUsize::new(1);
 
@@ -24,11 +32,9 @@ async fn main() {
 
     let manager = RedisConnectionManager::new("redis://localhost").unwrap();
     let pool = bb8::Pool::builder().build(manager).await.unwrap();
-
-    // let (rx, tx) = mpsc::unbounded_channel();
     {
-        // This is the task which will redirect subscriptions into (rx, tx)
         let pool = pool.clone();
+        let users = users.clone();
         tokio::task::spawn(async move {
             println!("Started task");
             let conn = bb8::Pool::dedicated_connection(&pool).await.unwrap();
@@ -36,14 +42,26 @@ async fn main() {
             let subscribed = pubsub.subscribe("Chat 1").await;
             println!("subbed: {:?}", subscribed);
             while let Some(result) = pubsub.on_message().next().await {
-                println!("{:?}", result);
-            };
-
-            // I want to feed each message into (tx)
-
+                let payload = result.get_payload::<String>().unwrap();
+                let received_message: ChatMessage =
+                    serde_json::from_str(&String::from(payload)).unwrap();
+                // let new_msg = format!("{:?}", result.get_payload::<String>().unwrap());
+                let text = format!(
+                    "User {}: {}",
+                    received_message.userId, received_message.content
+                );
+                for (&uid, tx) in users.read().await.iter() {
+                    if uid != received_message.userId {
+                        if let Err(_disconnected) = tx.send(Ok(Message::text(&text))) {
+                            // The tx is disconnected, our `user_disconnected` code
+                            // should be happening in another task, nothing more to
+                            // do here.
+                        }
+                    }
+                }
+            }
         });
     };
-
     // What on earth is this doing
     let users = warp::any().map(move || users.clone());
 
@@ -108,7 +126,12 @@ async fn user_connected(ws: WebSocket, users: Users, pool: bb8::Pool<RedisConnec
     user_disconnected(my_id, &users2).await;
 }
 
-async fn user_message(my_id: usize, msg: Message, users: &Users, pool: &bb8::Pool<RedisConnectionManager>) {
+async fn user_message(
+    my_id: usize,
+    msg: Message,
+    users: &Users,
+    pool: &bb8::Pool<RedisConnectionManager>,
+) {
     // Skip any non-Text messages...
     let msg = if let Ok(s) = msg.to_str() {
         s
@@ -116,28 +139,31 @@ async fn user_message(my_id: usize, msg: Message, users: &Users, pool: &bb8::Poo
         return;
     };
 
-    let new_msg = format!("<User#{}>: {}", my_id, msg);
-
+    let newer_msg = ChatMessage {
+        userId: my_id,
+        content: msg.to_string(),
+        channel: "Chat 1".to_string(),
+    };
     // Send off to Redis
     let mut conn = pool.get().await.unwrap();
-    let reply: String = redis::cmd("PUBLISH")
+    let reply: i32 = redis::cmd("PUBLISH")
         .arg("Chat 1")
-        .arg("Hi")
+        .arg(serde_json::to_string(&newer_msg).unwrap())
         .query_async(&mut *conn)
         .await
         .unwrap();
     println!("pub: {:?}", reply);
 
     // New message from this user, send it to everyone else (except same uid)...
-    for (&uid, tx) in users.read().await.iter() {
-        if my_id != uid {
-            if let Err(_disconnected) = tx.send(Ok(Message::text(new_msg.clone()))) {
-                // The tx is disconnected, our `user_disconnected` code
-                // should be happening in another task, nothing more to
-                // do here.
-            }
-        }
-    }
+    // for (&uid, tx) in users.read().await.iter() {
+    //     if my_id != uid {
+    //         if let Err(_disconnected) = tx.send(Ok(Message::text(new_msg.clone()))) {
+    // The tx is disconnected, our `user_disconnected` code
+    // should be happening in another task, nothing more to
+    // do here.
+    //         }
+    //     }
+    // }
 }
 
 async fn user_disconnected(my_id: usize, users: &Users) {
